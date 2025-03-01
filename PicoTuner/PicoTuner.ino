@@ -19,12 +19,16 @@
 // work around for Errata E15 in RP2040 datasheet. USB controller can lock up if a large bulk transfer is started near the end of a USB frame. 
 // This fix limits tranfers to the first 80% of the frame time 
 
-#define FIX_ERRATA_E15
+// v0.14 - SV8ARJ mods - Tag :  ARJ_01
+//  Forced aligned 4 the DMA buffers
+//  Overclocked the PICO 2
+//  Double buffered the DMA buffers - Seems to stabilize and clean data
 
+#define FIX_ERRATA_E15
 
 //Version Number BCD   vvrr
 #define VERSIONMAJOR 0
-#define VERSIONMINOR 12                         
+#define VERSIONMINOR 14                         
 //Define the USB VID/PID values. 2E8A:BA2C uses the Raspberry Pi VID and a random PID. 
 //Original FTDI chip uses 0403:6010
 #define USBVID 0x2E8A
@@ -102,8 +106,12 @@ uint sm_8 = 0;            //State machine for 8 bit port use state machine 0 on 
 uint sm_TS2 = 3;           //TS2 Input Use State machine 3 on pio1
 
 #define TSPACKETLENW 47                               //47 32bit words equals one 188 byte TS packet. 
-uint32_t TS2DMA[TSPACKETLENW];                        //DMA buffer for TS2 Packet              
-uint32_t TS1DMA[TSPACKETLENW];                        //DMA buffer for TS1 Packet
+
+__attribute__((aligned(4))) uint32_t TS2DMA[2][TSPACKETLENW];  // ARJ_01 Double buffers
+__attribute__((aligned(4))) uint32_t TS1DMA[2][TSPACKETLENW];  // ARJ_01 Double buffers
+
+volatile int activeBuffer1 = 0;     // ARJ_01 Double buffers
+volatile int activeBuffer2 = 0;     // ARJ_01 Double buffers
 
 uint DMA2Chan;
 uint DMA1Chan;
@@ -120,6 +128,9 @@ unsigned long lastmillis =0;
 //Core 0 does most of the work. 
 void setup() 
 {
+
+  // set_sys_clock_khz(250000, true);  // Overclock to 250MHz // ARJ_01 Because why not ?
+
    pinMode(DEBUG1,OUTPUT);
    pinMode(DEBUG2,OUTPUT);
    pinMode(LED,OUTPUT);
@@ -179,13 +190,17 @@ void setup()
 
     // Wait until configured
     while (!configured) {
-        tight_loop_contents();
+        // ARJ_01 tight_loop_contents();
+        __wfi();  // ARJ_01   Wait-for-Interrupt - efficient CPU idle, do we care ? better init ? We'll see 
     }
+
 
     digitalWrite(ENA3V3, HIGH);
 
-    // Get ready to rx MPSSE commands from host
     
+
+
+    // Get ready to rx MPSSE commands from host
     usb_start_transfer(usb_get_endpoint_configuration(EP2_OUT_ADDR), NULL, 64);
 
 }
@@ -233,18 +248,6 @@ void loop()
     sendTS2NI(TSNORMAL);
   }
 
-  if((millis() > EP83Timeout)&&(!TS2TransferInProgress))       //send a status packet every 16ms and reset the TS state machine if we have not sent anything recently. 
-  {
-    sendTS2NI(TSSTATUS);
-    dma_channel_set_irq0_enabled(DMA2Chan, false);
-    dma_channel_abort(DMA2Chan);
-    dma_channel_acknowledge_irq0(DMA2Chan);
-    pio_sm_restart(piob, sm_TS2);
-    dma_channel_set_irq0_enabled(DMA2Chan, true);
-    dma_hw->ints0 = 1u << DMA2Chan;
-    dma_channel_set_write_addr(DMA2Chan, TS2DMA, true);
-    clearBuffers(2);
-  }
 
    if((TS1BufsAvailable() >= 1 )&&(!TS1TransferInProgress))       //wait till we have a 512 byte transfer like the FTDI chip does. 
   {
@@ -293,64 +296,62 @@ void loop()
 
 //setup1() initialises Core 1 of the RP2040.
 //Core 1 does the high priority work   
-void setup1()
-{
-  //Setup DMA for TS2
+//
+// ARJ_01
+//
+// setup1() initializes Core 1 for high-priority work.
+void setup1() {
+    // Setup DMA for TS2
+    DMA2Chan = dma_claim_unused_channel(true);
+    dma_channel_config c2 = dma_channel_get_default_config(DMA2Chan);
+    channel_config_set_transfer_data_size(&c2, DMA_SIZE_32);
+    channel_config_set_read_increment(&c2, false);
+    channel_config_set_write_increment(&c2, true);
+    channel_config_set_dreq(&c2, DREQ_PIO1_RX3);
 
-  DMA2Chan = dma_claim_unused_channel(true);
- 
-  dma_channel_config c2 = dma_channel_get_default_config(DMA2Chan);
-
-  channel_config_set_transfer_data_size(&c2, DMA_SIZE_32);
-  channel_config_set_read_increment(&c2, false);
-  channel_config_set_write_increment(&c2, true);
-  channel_config_set_dreq(&c2, DREQ_PIO1_RX3);
-
-  dma_channel_configure(
+    dma_channel_configure(
         DMA2Chan,               // Channel to be configured
         &c2,                    // The configuration we just created
         TS2DMA,                 // The initial write address the TS buffer
-        &piob->rxf[sm_TS2],      // Source pointer
+        &piob->rxf[sm_TS2],      // Source pointer (matches original)
         TSPACKETLENW,            // Number of transfers
-        false                    // do not start immediately.
+        false                    // Do not start immediately
     );
-        
-    dma_channel_set_irq0_enabled(DMA2Chan, true);      // Tell the DMA to raise IRQ line 0 when the channel finishes a block
 
- //Setup DMA for TS1
+    dma_channel_set_irq0_enabled(DMA2Chan, true);  // Enable interrupt for DMA2
 
-  DMA1Chan = dma_claim_unused_channel(true);
- 
-  dma_channel_config c1 = dma_channel_get_default_config(DMA1Chan);
+    // Setup DMA for TS1
+    DMA1Chan = dma_claim_unused_channel(true);
+    dma_channel_config c1 = dma_channel_get_default_config(DMA1Chan);
+    channel_config_set_transfer_data_size(&c1, DMA_SIZE_32);
+    channel_config_set_read_increment(&c1, false);
+    channel_config_set_write_increment(&c1, true);
+    channel_config_set_dreq(&c1, DREQ_PIO0_RX3);
 
-  channel_config_set_transfer_data_size(&c1, DMA_SIZE_32);
-  channel_config_set_read_increment(&c1, false);
-  channel_config_set_write_increment(&c1, true);
-   channel_config_set_dreq(&c1, DREQ_PIO0_RX3);
-
-  dma_channel_configure(
+    dma_channel_configure(
         DMA1Chan,               // Channel to be configured
         &c1,                    // The configuration we just created
         TS1DMA,                 // The initial write address the TS buffer
-        &pioa->rxf[sm_TS1],     // Source pointer
-        TSPACKETLENW,           // Number of transfers
-        false                    // do not start immediately.
+        &pioa->rxf[sm_TS1],      // Source pointer (matches original)
+        TSPACKETLENW,            // Number of transfers
+        false                    // Do not start immediately
     );
-        
-    dma_channel_set_irq1_enabled(DMA1Chan, true);      // Tell the DMA to raise IRQ line 1 when the channel finishes a block 
 
-  //start the DMA transfers
-    irq_set_exclusive_handler(DMA_IRQ_0, DMA2_handler);       // Configure the processor to run dma_handler() when DMA IRQ 0 is asserted
+    dma_channel_set_irq1_enabled(DMA1Chan, true);  // Enable interrupt for DMA1
+
+    // Start the DMA transfers
+    irq_set_exclusive_handler(DMA_IRQ_0, DMA2_handler);  // Assign DMA2 handler
     irq_set_enabled(DMA_IRQ_0, true);
+    DMA2_handler();  // Manually trigger TS2 DMA handler to start transfers
 
-    DMA2_handler();        //manually call the handler once to start the transfers
-
-    irq_set_exclusive_handler(DMA_IRQ_1, DMA1_handler);       // Configure the processor to run dma_handler() when DMA IRQ 1 is asserted
+    irq_set_exclusive_handler(DMA_IRQ_1, DMA1_handler);  // Assign DMA1 handler
     irq_set_enabled(DMA_IRQ_1, true);
-
-   DMA1_handler();        //manually call the handler once to start the transfers
-
+    DMA1_handler();  // Manually trigger TS1 DMA handler to start transfers
 }
+//
+// ARJ_01
+
+
 
 
 //loop1() uses Core 1 of the RP2040
@@ -365,10 +366,11 @@ void loop1()
                                                         
   if(TS2DMAAvailable)                     //have we received a new TS2 Packet?
     {
+      unsigned int tmpBufr2 = !activeBuffer2 ; // ARJ_01 Use the full buffer (0 or 1)
       TS2ActiveTimeout = TSTIMEOUT;
        for(int i=0; i < 47; i++)
          {
-            wor.w = TS2DMA[i];                 //Get the next available 4 bytes of the TS packet  
+            wor.w = TS2DMA[tmpBufr2][i];                 //Get the next available 4 bytes of the TS packet  
             for(int b=3;b>=0;b--)                              //and copy them as bytes to the USB buffer. 
               {
                 TS2Buf[TS2BufInNumber][TS2BufInPointer++] = wor.b[b];
@@ -385,10 +387,11 @@ void loop1()
 
   if(TS1DMAAvailable)                     //have we received a new TS1 Packet?
     {
+      unsigned int tmpBufr1 = !activeBuffer1 ; // ARJ_01 Use the full buffer (0 or 1)
       TS1ActiveTimeout = TSTIMEOUT;
        for(int i=0; i < 47; i++)
          {
-            wor.w= TS1DMA[i];                 //Get the next available 4 bytes of the TS packet  
+            wor.w= TS1DMA[tmpBufr1][i];                 //Get the next available 4 bytes of the TS packet  
             for(int b=3;b>=0;b--)                              //and copy them to the buffer. 
               {
                 TS1Buf[TS1BufInNumber][TS1BufInPointer++] = wor.b[b];
@@ -411,8 +414,9 @@ void DMA2_handler()
   // Clear the interrupt request.
     dma_hw->ints0 = 1u << DMA2Chan;
     // Give the channel a new write address, and re-trigger it
-    dma_channel_set_write_addr(DMA2Chan, TS2DMA, true);
+    dma_channel_set_write_addr(DMA2Chan, TS2DMA[activeBuffer2], true);  // ARJ_01
     TS2DMAAvailable = true;        //flag the data is avaiable. 
+    activeBuffer2 = !activeBuffer2;   // ARJ_01
 }
 
 //interrupt called when DMA for TS1 has completed. 
@@ -421,8 +425,9 @@ void DMA1_handler()
   // Clear the interrupt request.
     dma_hw->ints1 = 1u << DMA1Chan;
     // Give the channel a new write address, and re-trigger it
-    dma_channel_set_write_addr(DMA1Chan, TS1DMA, true);
+    dma_channel_set_write_addr(DMA1Chan, TS1DMA[activeBuffer1], true);
     TS1DMAAvailable = true;        //flag the data is avaiable. 
+    activeBuffer1 = !activeBuffer1;   // ARJ_01
 }
 
 
